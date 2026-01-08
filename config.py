@@ -6,7 +6,8 @@
 # Number of parallel environments. 
 # On Colab (2 cores), keep this around 8-16. 
 # On powerful PC (24 cores), go for 48-64.
-NUM_CPU = 48 
+import multiprocessing
+NUM_CPU = multiprocessing.cpu_count()
 
 # --- TRAINING DURATION ---
 # Total number of frames/steps to train for.
