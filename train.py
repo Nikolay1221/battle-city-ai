@@ -15,6 +15,22 @@ import torch as th # Added for Architecture Config
 import torch as th # Added for Architecture Config
 import config # <--- IMPORT CONFIG
 
+def linear_schedule(initial_value: float):
+    """
+    Linear learning rate schedule.
+    :param initial_value: The initial learning rate.
+    :return: schedule that computes current learning rate depending on remaining progress
+    """
+    if isinstance(initial_value, str):
+        initial_value = float(initial_value)
+
+    def func(progress_remaining: float) -> float:
+        """
+        Progress will decrease from 1 (beginning) to 0.
+        """
+        return progress_remaining * initial_value
+    return func
+
 # Network Architecture calculation (Dependent on Config)
 # 2048 bytes * STACK_SIZE
 first_layer_size = 1024 * config.STACK_SIZE 
@@ -211,10 +227,16 @@ def train():
     if os.path.exists(latest_model_path):
         print(f"Loading interrupted model from {latest_model_path}...")
         model = PPO.load(latest_model_path, env=env)
+        model.learning_rate = linear_schedule(config.LR_START) # Update schedule
+        model.ent_coef = config.ENTROPY_COEF
+        model.clip_range = lambda _: config.CLIP_RANGE
         reset_timesteps = False
     elif os.path.exists(final_model_path):
         print(f"Loading existing model from {final_model_path}...")
         model = PPO.load(final_model_path, env=env)
+        model.learning_rate = linear_schedule(config.LR_START) # Update schedule
+        model.ent_coef = config.ENTROPY_COEF
+        model.clip_range = lambda _: config.CLIP_RANGE
         reset_timesteps = False
     else:
         print(f"Creating NEW MODEL ({first_layer_size}x{first_layer_size//2})...")
@@ -229,13 +251,13 @@ def train():
             env, 
             verbose=1,
             tensorboard_log=config.LOG_DIR,
-            learning_rate=config.LEARNING_RATE,
+            learning_rate=linear_schedule(config.LR_START),
             n_steps=config.N_STEPS,          # Frequent updates
             batch_size=config.BATCH_SIZE,       # Standard batch size
             ent_coef=config.ENTROPY_COEF,         # EXTREME CURIOSITY (Prevent boredom)
             gamma=0.99,
             gae_lambda=0.95,
-            clip_range=0.2,
+            clip_range=config.CLIP_RANGE,
             # ent_coef=0.1, (Removed duplicate)
             device="cuda",
             policy_kwargs=policy_kwargs

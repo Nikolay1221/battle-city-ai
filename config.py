@@ -13,11 +13,13 @@ TOTAL_TIMESTEPS = 5_000_000  # Total frames to train for.
 CHECKPOINT_FREQ = 10_000     # Save model every N steps.
 
 # --- HYPERPARAMETERS ---
-LEARNING_RATE = 0.0003  # 3e-4: Standard stable PPO rate.
+# LEARNING_RATE_SCHEDULE with linear decay
+LR_START = 0.0003       # Start: Fast learning
+LR_END = 0.0            # End: Micro-tuning (effectively 0)
 ENTROPY_COEF = 0.05     # 0.05: Balanced exploration. Tries new things but doesn't ignore rewards.
-CLIP_RANGE = 0.2        # 0.2: Standard PPO clipping. Allows healthy updates.
-BATCH_SIZE = 256
-N_STEPS = 512           # Steps per update per env.
+CLIP_RANGE = 0.1        # 0.1: Less "jumping". More conservative updates.
+BATCH_SIZE = 512        # 512: Averaging more examples to smooth out noise.
+N_STEPS = 2048          # 2048: Standard deep RL buffer. Much more stable updates.
 
 # --- PATHS ---
 MODEL_DIR = "models"
