@@ -240,11 +240,11 @@ class BattleCityEnv(gym.Env):
             if diff > 0 and diff < 10:
                 # OLD: pts = (i + 1) * 100 (100..400)
                 # NORMALIZED TO GOLDEN ZONE (Points / 1000)
-                # Tank 1 (100pts) -> 0.1
-                # Tank 2 (200pts) -> 0.2
-                # Tank 3 (300pts) -> 0.3
-                # Tank 4 (400pts) -> 0.4
-                base_scores = [0.1, 0.2, 0.3, 0.4] 
+                # Tank 1 (100pts) -> 1.0 (Base)
+                # Tank 2 (200pts) -> 1.5 (Fast)
+                # Tank 3 (300pts) -> 2.0 (Power)
+                # Tank 4 (400pts) -> 3.0 (Bonus)
+                base_scores = [1.0, 1.5, 2.0, 3.0] 
                 pts = base_scores[i]
                 reward += pts * diff 
         self.prev_kills = curr_kills
@@ -268,7 +268,7 @@ class BattleCityEnv(gym.Env):
         if curr_lives < 10 and self.prev_lives < 10:
              # Check if we didn't just reset (sometimes state creates ghost lives)
              if curr_lives < self.prev_lives:
-                reward -= 0.1 # Normalized (-0.5 -> -0.1)
+                reward -= 1.0 # Normalized (-0.5 -> -0.1 -> -1.0) Symmetric to Kill
         self.prev_lives = curr_lives
         
         # 4. Game Over (Vision - Restored & Tuned)
@@ -284,8 +284,8 @@ class BattleCityEnv(gym.Env):
              # HEAVY PENALTY FOR BASE DESTRUCTION
              # If game ended but we didn't lose a life -> Base was destroyed!
              if curr_lives >= self.prev_lives:
-                 reward -= 5.0 # Massive punishment for losing base
-                 # print("DEBUG: BASE DESTROYED! Punishment: -5.0")
+                 reward -= 3.0 # Massive punishment for losing base (Reduced from -5.0)
+                 # print("DEBUG: BASE DESTROYED! Punishment: -3.0")
              else:
                  reward -= 1.0 # Standard Game Over (Ran out of lives)
 
@@ -305,7 +305,7 @@ class BattleCityEnv(gym.Env):
         if curr_lives > 0:
             # 6. MOVEMENT REWARD (Normalized)
             if curr_x != self.prev_x or curr_y != self.prev_y:
-                 reward += 0.03 # Movement reward
+                 # reward += 0.0 # Movement reward REMOVED (Noise)
                  self.idle_steps = 0
                  
                  # 7. GRID EXPLORATION (New!)
@@ -316,7 +316,7 @@ class BattleCityEnv(gym.Env):
                  sector = (sec_x, sec_y)
                  
                  if sector not in self.visited_sectors:
-                     reward += 0.1 # Discovery Bonus! (Like finding a coin)
+                     reward += 0.02 # Discovery Bonus! (Tiny epsilon)
                      self.visited_sectors.add(sector)
                      # print(f"DEBUG: New Sector Discovered {sector}!")
             else:
