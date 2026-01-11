@@ -21,6 +21,7 @@ except ImportError:
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env # Needed for dynamic kwargs
+from stable_baselines3.common.vec_env import VecNormalize # <--- Added
 from battle_city_env import BattleCityEnv
 import torch as th # Added for Architecture Config
 
@@ -363,6 +364,9 @@ def train():
     else:
         env = make_vec_env(BattleCityEnv, n_envs=1, seed=42, vec_env_cls=DummyVecEnv, env_kwargs=env_kwargs)
 
+    # Apply VecNormalize (Stabilizes Training)
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+
     # Load or Create Model
     # Choose Policy Type based on Config
     policy_type = "MultiInputPolicy" if config.USE_VISION else "MlpPolicy"
@@ -424,6 +428,7 @@ def train():
 
     # --- MODEL CREATION ---
     if model is None:
+        if getattr(config, 'USE_TRANSFORMER', False):
             # HYBRID MODE: Tansformer + LSTM
             if getattr(config, 'USE_RECURRENT', False): 
                  print("Creating NEW MODEL (Hybrid: Transformer + RecurrentPPO)...")
