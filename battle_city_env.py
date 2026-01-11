@@ -16,6 +16,8 @@ class BattleCityEnv(gym.Env):
         self.render_mode = render_mode
         self.USE_VISION = use_vision
         self.STACK_SIZE = stack_size
+        self.MAX_STEPS = 100_000_000 # Unlimited (almost).
+        self.steps_in_episode = 0
         
         # Raw Env
         self.raw_env = NESEnv(ROM_PATH)
@@ -58,10 +60,14 @@ class BattleCityEnv(gym.Env):
         # RAM Stack Buffer
         self.ram_stack = deque(maxlen=self.STACK_SIZE)
 
-        # Load Templates
-        self.game_over_tmpl = cv2.imread('templates/game_over.png', cv2.IMREAD_GRAYSCALE)
-        if self.game_over_tmpl is None:
-            raise ValueError("Template templates/game_over.png not found!")
+        # Load Templates (With Colab Fail-Safe)
+        self.game_over_tmpl = None
+        try:
+            self.game_over_tmpl = cv2.imread('templates/game_over.png', cv2.IMREAD_GRAYSCALE)
+            if self.game_over_tmpl is None:
+                print("Warning: templates/game_over.png not found. Switched to RAM Game Over (Experimental).")
+        except Exception:
+             print("Warning: Template load failed. Switched to RAM Game Over.")
 
         # RAM Addresses
         self.ADDR_LIVES = 0x51
@@ -88,7 +94,6 @@ class BattleCityEnv(gym.Env):
         
         # Step Logic
         self.steps_in_episode = 0
-        self.MAX_STEPS = 5000 
         
         # Frame Stack Buffer
         self.frames = deque(maxlen=self.STACK_SIZE)
@@ -142,6 +147,7 @@ class BattleCityEnv(gym.Env):
         self.steps_in_episode = 0
         self.episode_score = 0.0 # Reset score
         self.visited_sectors = set() # Track visited 16x16 zones
+        self.steps_in_episode = 0 # Reset Time Counter
         
         # Clear Buffers
         self.frames.clear()
@@ -182,7 +188,6 @@ class BattleCityEnv(gym.Env):
         self.prev_lives = int(self.raw_env.ram[self.ADDR_LIVES])
         self.prev_kills = [int(self.raw_env.ram[addr]) for addr in self.ADDR_KILLS]
         self.prev_bonus = int(self.raw_env.ram[self.ADDR_BONUS])
-        self.prev_bonus = int(self.raw_env.ram[self.ADDR_BONUS])
         self.prev_stage = int(self.raw_env.ram[self.ADDR_STAGE])
         self.prev_x = int(self.raw_env.ram[self.ADDR_X])
         self.prev_y = int(self.raw_env.ram[self.ADDR_Y])
@@ -218,17 +223,26 @@ class BattleCityEnv(gym.Env):
         
         self.steps_in_episode += 1 
         
-        # Process and Push new frame
-        processed = self._process_frame(obs)
-        self.frames.append(processed)
-        
-        info = {}
-        info['render'] = processed # FOR VISUALIZATION WINDOW (Bypass Agent)
+        # Process and Push new frame (Optimized)
+        if self.USE_VISION:
+             processed = self._process_frame(obs)
+             self.frames.append(processed)
+             info['render'] = processed 
+        else:
+             # Skip expensive CV2 if blind
+             # But keep stack full for consistency if we switch back
+             # We just push zeros or skip entirely?
+             # Logic expects self.frames to exist for RenderCallback in VISUAL mode.
+             # If HEADLESS, we don't care.
+             # Just append dummy if needed or nothing?
+             # RenderCallback checks info['render'].
+             info['render'] = None 
         
         ram = self.raw_env.ram # Access RAM from raw env
         reward = 0 
         
-         # 0. Time Penalty
+        # 0. Time Penalty
+        # 0. Time Penalty
         if self.steps_in_episode >= self.MAX_STEPS:
             truncated = True # Time Limit = Truncated
             info["TimeLimit.truncated"] = True
@@ -271,28 +285,29 @@ class BattleCityEnv(gym.Env):
                 reward -= 1.0 # Normalized (-0.5 -> -0.1 -> -1.0) Symmetric to Kill
         self.prev_lives = curr_lives
         
-        # 4. Game Over (Vision - Restored & Tuned)
-        # RAM check failed for user. Vision worked but missed Stage 2. 
-        # Lowering threshold 0.8 -> 0.7 to be more robust against background changes.
-        gray_full = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-        res = cv2.matchTemplate(gray_full, self.game_over_tmpl, cv2.TM_CCOEFF_NORMED)
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-        
-        if max_val > 0.7: 
-             terminated = True # Game Over = Terminated
+        # 4. Game Over (Hybrid: Vision Prefered, RAM Fallback)
+        curr_state = int(ram[self.ADDR_STATE]) # Get current state for RAM fallback
+        if self.game_over_tmpl is not None:
+             # Vision Check
+             gray_full = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
+             res = cv2.matchTemplate(gray_full, self.game_over_tmpl, cv2.TM_CCOEFF_NORMED)
+             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
              
-             # HEAVY PENALTY FOR BASE DESTRUCTION
-             # If game ended but we didn't lose a life -> Base was destroyed!
-             if curr_lives >= self.prev_lives:
-                 reward -= 3.0 # Massive punishment for losing base (Reduced from -5.0)
-                 # print("DEBUG: BASE DESTROYED! Punishment: -3.0")
-             else:
-                 reward -= 1.0 # Standard Game Over (Ran out of lives)
-
-    # (Fixing reset RAM type below in separate chunk if needed, but I'll try to do it here if close enough? No, 276 is far from 193. Need MultiReplace)
-             
-        # RAM Check Disabled (User reported non-functional)
-        # if int(ram[self.ADDR_STATE]) == 0xE0: ... 
+             if max_val > 0.7: 
+                  terminated = True 
+                  if curr_lives >= self.prev_lives:
+                      reward -= 3.0 # Base Destroyed
+                  else:
+                      reward -= 1.0
+        else:
+             # RAM Fallback (If template missing)
+             # State 0xE0 appears to be Game Over in some versions
+             if curr_state == 0xE0: 
+                  terminated = True
+                  if curr_lives >= self.prev_lives:
+                       reward -= 3.0
+                  else:
+                       reward -= 1.0 
             
         # 5. Idle Penalty (Coordinate Based)
         

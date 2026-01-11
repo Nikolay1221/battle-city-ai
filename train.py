@@ -1,11 +1,23 @@
 import gymnasium as gym
 import os
 import time
-import cv2            # Added for rendering
-import numpy as np    # Added for rendering
-import pickle         # Added for Graph Persistence
-from collections import deque # Added for Score History
+import math
+import cv2
+import numpy as np
+import pickle
+from collections import deque
 from stable_baselines3 import PPO
+import torch
+import torch.nn as nn
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+
+try:
+    from sb3_contrib import RecurrentPPO
+except ImportError:
+    print("Warning: sb3-contrib not installed. RecurrentPPO unavailable.")
+    RecurrentPPO = None
+
+
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env # Needed for dynamic kwargs
@@ -58,6 +70,13 @@ class RenderCallback(BaseCallback):
         self.windows_initialized = False # Flag for window setup
         self.history_path = f"{config.MODEL_DIR}/score_history.pkl"
         
+        # HEADLESS AUTO-DETECT
+        # 1. Config override
+        # 2. 'DISPLAY' env var missing (Linux/Colab)
+        if getattr(config, 'HEADLESS_MODE', False) or (os.name == 'posix' and 'DISPLAY' not in os.environ):
+             print("[System] HEADLESS MODE DETECTED (Colab/Server). GUI Disabled.")
+             self.windows_initialized = "HEADLESS" # Permanently disable rendering
+        
         # Load History if exists
         if os.path.exists(self.history_path):
             try:
@@ -82,7 +101,8 @@ class RenderCallback(BaseCallback):
             for i, done in enumerate(dones):
                 if done:
                     final_score = infos[i].get('score', 0)
-                    self.score_history.append(final_score)
+                    # NEW: Store Tuple (Score, Timestep)
+                    self.score_history.append((final_score, self.num_timesteps))
                     any_finished = True
             
             if any_finished:
@@ -92,27 +112,83 @@ class RenderCallback(BaseCallback):
                         pickle.dump(self.score_history, f)
                 except Exception as e:
                     print(f"[Graph] Save failed: {e}")
+                
+                # --- LOG STATS TO CONSOLE (USER REQUEST) ---
+                try:
+                    # Extract just scores
+                    all_scores = []
+                    # Optimization: If history is huge, maybe slice? But 100k is fine.
+                    for item in self.score_history:
+                        if isinstance(item, (tuple, list)):
+                             all_scores.append(float(item[0]))
+                        else:
+                             all_scores.append(float(item))
+                    
+                    if all_scores:
+                        self.logger.record("rollout/max_score", max(all_scores))
+                        self.logger.record("rollout/avg_score_all", np.mean(all_scores))
+                        self.logger.record("rollout/last_score", all_scores[-1])
+                except Exception:
+                    pass
 
             current_obs = self.locals.get('new_obs')
             
             # --- SCORE GRAPH (SEPARATE WINDOW) ---
             # Update Graph window every step (it's fast)
+            if self.windows_initialized == "HEADLESS":
+                return True # Skip rendering
+                
             try:
                 # Create black canvas
                 g_w, g_h = 800, 400 
                 graph_frame = np.zeros((g_h, g_w, 3), dtype=np.uint8)
 
                 if len(self.score_history) > 1:
-                    scores = list(self.score_history)
+                    scores = []
+                    steps = []
+                    for i, item in enumerate(self.score_history):
+                        try:
+                            if isinstance(item, tuple) or isinstance(item, list):
+                                if len(item) >= 2:
+                                    scores.append(float(item[0]))
+                                    steps.append(int(item[1]))
+                                elif len(item) == 1:
+                                    scores.append(float(item[0]))
+                                    steps.append(0)
+                            else:
+                                scores.append(float(item))
+                                steps.append(0)
+                        except: continue
+                        
+                    if not scores: return True # Skip if empty after filtering
+                    
                     min_s, max_s = min(scores), max(scores)
                     if max_s == min_s: max_s += 1 
                     
                     # Dynamic X-Scale
                     total_points = len(scores)
                     
+                    # Colors for Cycles (Rainbow-ish)
+                    # BGR format
+                    colors = [
+                        (0, 0, 255),    # Red
+                        (0, 165, 255),  # Orange
+                        (0, 255, 255),  # Yellow
+                        (0, 255, 0),    # Green
+                        (255, 255, 0),  # Cyan
+                        (255, 0, 0),    # Blue
+                        (255, 0, 255),  # Magenta
+                    ]
+                    
                     for i in range(1, total_points):
                         p1_val = scores[i-1]
                         p2_val = scores[i]
+                        
+                        # Determine Color based on Step Count of the SECOND point
+                        # Cycle changes every config.N_STEPS
+                        step_val = steps[i]
+                        cycle_idx = (step_val // config.N_STEPS) % len(colors)
+                        line_color = colors[cycle_idx]
                         
                         # Scales
                         x1 = int((i-1) * (g_w / (total_points - 1)))
@@ -122,11 +198,11 @@ class RenderCallback(BaseCallback):
                         y1 = int((g_h - 20) - ((p1_val - min_s) / (max_s - min_s)) * (g_h - 40))
                         y2 = int((g_h - 20) - ((p2_val - min_s) / (max_s - min_s)) * (g_h - 40))
                         
-                        cv2.line(graph_frame, (x1, y1), (x2, y2), (0, 255, 255), 1)
+                        cv2.line(graph_frame, (x1, y1), (x2, y2), line_color, 2) # Thicker line (2)
                         
                         # Only draw dots if not too crowded
                         if total_points < 100:
-                            cv2.circle(graph_frame, (x2, y2), 3, (0, 0, 255), -1)
+                            cv2.circle(graph_frame, (x2, y2), 3, (255, 255, 255), -1)
 
                     # Stats Text
                     cv2.putText(graph_frame, f"Max Score: {max_s:.2f}", (10, 30), 
@@ -135,12 +211,20 @@ class RenderCallback(BaseCallback):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
                     cv2.putText(graph_frame, f"Last: {scores[-1]:.2f}", (10, 90), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+                    
+                    # Current Cycle Info
+                    current_cycle = self.num_timesteps // config.N_STEPS
+                    cv2.putText(graph_frame, f"Update Cycle: {current_cycle}", (550, 30), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors[current_cycle % len(colors)], 2)
+                                
                 else:
                      cv2.putText(graph_frame, "Waiting for games...", (100, 200), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
                 cv2.imshow("Score History Graph", graph_frame)
-            except: pass
+            except Exception as e: 
+                # print(f"Graph Error: {e}")
+                pass
             
             # One-time Window Setup
             if not self.windows_initialized:
@@ -196,6 +280,70 @@ class RenderCallback(BaseCallback):
             pass
         return True
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+        # Create constant 'pe' matrix with values dependent on pos and i
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        # x: [Batch, SeqLen, Dim]
+        # Add position encoding to the embedding
+        return x + self.pe[:, :x.size(1), :]
+
+class TransformerFeatureExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 512):
+        # Observation space is (N_STACK * RAM_SIZE) flattened
+        # We assume input is (Batch, STACK_SIZE * RAM_SIZE)
+        
+        super().__init__(observation_space, features_dim)
+        
+        self.stack_size = config.STACK_SIZE
+        self.ram_size = 2048 # Fixed NES RAM
+        self.d_model = 512   # Embedding Size
+        self.nhead = 8
+        self.num_layers = 4
+        
+        # Project RAM (2048) -> Embedding (512)
+        self.input_net = nn.Sequential(
+            nn.Linear(self.ram_size, self.d_model),
+            nn.ReLU()
+        )
+        
+        self.pos_encoder = PositionalEncoding(self.d_model, max_len=self.stack_size)
+        
+        encoder_layer = nn.TransformerEncoderLayer(d_model=self.d_model, nhead=self.nhead, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        # Input: (Batch, STACK_SIZE * RAM_SIZE)
+        batch_size = observations.shape[0]
+        
+        # Reshape to (Batch, Stack, RAM)
+        # Verify shape logic: SB3 flattens inputs.
+        x = observations.view(batch_size, self.stack_size, self.ram_size)
+        
+        # Project to Embedding
+        x = self.input_net(x) # (Batch, Stack, 512)
+        
+        # Add Position
+        x = self.pos_encoder(x)
+        
+        # Transformer Pass
+        x = self.transformer_encoder(x) # (Batch, Stack, 512)
+        
+        # Aggregation: Take the LAST vector (The most recent frame, enriched by history)
+        # The sequence is usually [Oldest ... Newest] 
+        # In our env implementation: append() adds to end. So -1 is newest.
+        features = x[:, -1, :] # (Batch, 512)
+        
+        return features
+
 def train():
     os.makedirs(config.MODEL_DIR, exist_ok=True)
     os.makedirs(config.LOG_DIR, exist_ok=True)
@@ -224,44 +372,181 @@ def train():
     latest_model_path = f"{config.MODEL_DIR}/battle_city_interrupted.zip"
     final_model_path = f"{config.MODEL_DIR}/battle_city_final.zip"
     
+    # Determine Learning Rate
+    if hasattr(config, 'LR_START'):
+        lr_schedule = linear_schedule(config.LR_START)
+        print(f"Using Linear LR Schedule starting at {config.LR_START}")
+    else:
+        lr_schedule = config.LEARNING_RATE
+        print(f"Using Constant Learning Rate: {config.LEARNING_RATE}")
+
+    # Select Model Class
+    if getattr(config, 'USE_RECURRENT', False) and RecurrentPPO is not None:
+        ModelClass = RecurrentPPO
+        print("Model Class: RecurrentPPO (LSTM)")
+    else:
+        ModelClass = PPO
+        print("Model Class: Standard PPO")
+
     if os.path.exists(latest_model_path):
         print(f"Loading interrupted model from {latest_model_path}...")
-        model = PPO.load(latest_model_path, env=env)
-        model.learning_rate = linear_schedule(config.LR_START) # Update schedule
-        model.ent_coef = config.ENTROPY_COEF
-        model.clip_range = lambda _: config.CLIP_RANGE
-        reset_timesteps = False
+        try:
+            model = ModelClass.load(latest_model_path, env=env)
+            model.learning_rate = lr_schedule # Update schedule
+            model.ent_coef = getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01))
+            model.clip_range = lambda _: config.CLIP_RANGE
+            reset_timesteps = False
+        except Exception as e:
+            print(f"Failed to load model architecture mismatch? Error: {e}")
+            print("Starting FRESH model due to incompatibility.")
+            model = None # Trigger creation logic
+            reset_timesteps = True
+            
     elif os.path.exists(final_model_path):
         print(f"Loading existing model from {final_model_path}...")
-        model = PPO.load(final_model_path, env=env)
-        model.learning_rate = linear_schedule(config.LR_START) # Update schedule
-        model.ent_coef = config.ENTROPY_COEF
-        model.clip_range = lambda _: config.CLIP_RANGE
-        reset_timesteps = False
+        try:
+            model = ModelClass.load(final_model_path, env=env)
+            model.learning_rate = lr_schedule # Update schedule
+            model.ent_coef = getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01))
+            model.clip_range = lambda _: config.CLIP_RANGE
+            reset_timesteps = False
+        except Exception as e:
+             print(f"Failed to load model (mismatch?). Error: {e}")
+             model = None
+             reset_timesteps = True
     else:
-        print(f"Creating NEW MODEL ({first_layer_size}x{first_layer_size//2})...")
-        
-        policy_kwargs = dict(
-            activation_fn=th.nn.ReLU,
-            net_arch=dict(pi=[first_layer_size, first_layer_size//2], vf=[first_layer_size, first_layer_size//2])
-        )
-        
-        model = PPO(
-            policy_type, 
-            env, 
-            verbose=1,
-            tensorboard_log=config.LOG_DIR,
-            learning_rate=linear_schedule(config.LR_START),
-            n_steps=config.N_STEPS,          # Frequent updates
-            batch_size=config.BATCH_SIZE,       # Standard batch size
-            ent_coef=config.ENTROPY_COEF,         # EXTREME CURIOSITY (Prevent boredom)
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=config.CLIP_RANGE,
-            # ent_coef=0.1, (Removed duplicate)
-            device="cuda",
-            policy_kwargs=policy_kwargs
-        )
+        model = None
+        reset_timesteps = True
+
+    # --- TRANSFORMER ARCHITECTURE ---
+    # Moved to Global Scope
+
+
+    # --- MODEL CREATION ---
+    if model is None:
+            # HYBRID MODE: Tansformer + LSTM
+            if getattr(config, 'USE_RECURRENT', False): 
+                 print("Creating NEW MODEL (Hybrid: Transformer + RecurrentPPO)...")
+                 if RecurrentPPO is None:
+                     print("CRITICAL ERROR: sb3-contrib not installed. Cannot use LSTM.")
+                     return
+
+                 policy_kwargs = dict(
+                    features_extractor_class=TransformerFeatureExtractor,
+                    features_extractor_kwargs=dict(features_dim=512),
+                    net_arch=dict(pi=[512, 256], vf=[512, 256]), 
+                    activation_fn=th.nn.ReLU,
+                    lstm_hidden_size=512, # LSTM Layer size
+                    n_lstm_layers=1       # 1 Layer is enough for hybrid
+                 )
+                 
+                 # LSTM Policies
+                 if config.USE_VISION:
+                     lstm_policy_type = "MultiInputLstmPolicy"
+                 else:
+                     lstm_policy_type = "MlpLstmPolicy"
+                     
+                 model = RecurrentPPO(
+                    lstm_policy_type, 
+                    env, 
+                    verbose=1,
+                    tensorboard_log=config.LOG_DIR,
+                    learning_rate=lr_schedule,
+                    n_steps=config.N_STEPS,
+                    batch_size=config.BATCH_SIZE,
+                    n_epochs=getattr(config, 'N_EPOCHS', 10),
+                    ent_coef=getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01)),
+                    gamma=0.99,
+                    gae_lambda=0.95,
+                    clip_range=config.CLIP_RANGE,
+                    device="cuda",
+                    policy_kwargs=policy_kwargs 
+                 )
+
+            # STANDARD TRANSFORMER (No LSTM)
+            else:
+                 print(f"Creating NEW MODEL (Transformer PPO)... STACK_SIZE={config.STACK_SIZE}")
+                 policy_kwargs = dict(
+                    features_extractor_class=TransformerFeatureExtractor,
+                    features_extractor_kwargs=dict(features_dim=512),
+                    net_arch=dict(pi=[512, 256], vf=[512, 256]), 
+                    activation_fn=th.nn.ReLU,
+                 )
+    
+                 model = PPO(
+                    "MlpPolicy",
+                    env,
+                    verbose=1,
+                    tensorboard_log=config.LOG_DIR,
+                    learning_rate=lr_schedule, # Use the determined LR schedule
+                    n_steps=config.N_STEPS,
+                    batch_size=config.BATCH_SIZE,
+                    n_epochs=getattr(config, 'N_EPOCHS', 10),
+                    gamma=0.99,
+                    gae_lambda=0.95,
+                    clip_range=config.CLIP_RANGE,
+                    ent_coef=getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01)),
+                    policy_kwargs=policy_kwargs,
+                    device="cuda"
+                 )
+        else: # Original PPO/RecurrentPPO creation logic
+            # Define Network Architecture (Optimized for High-RAM Colab)
+            # OLD: [512, 256] -> Good.
+            # NEW: [1024, 512] -> Smarter. We have 15GB VRAM, let's use it.
+            
+            policy_kwargs = dict(
+                activation_fn=th.nn.ReLU,
+                net_arch=dict(pi=[1024, 512], vf=[1024, 512]),
+                lstm_hidden_size=1024, # <--- KEEP HUGE MEMORY
+                n_lstm_layers=2,       # <--- STABLE DEPTH (Gold Standard)
+                shared_lstm=False, 
+                enable_critic_lstm=True
+            )
+
+            # Check for RecurrentPPO (LSTM)
+            if getattr(config, 'USE_RECURRENT', False) and RecurrentPPO is not None:
+                 print("Creating NEW MODEL (RecurrentPPO / LSTM)...")
+                 # LSTM Policies
+                 if config.USE_VISION:
+                     lstm_policy_type = "MultiInputLstmPolicy"
+                 else:
+                     lstm_policy_type = "MlpLstmPolicy"
+                 
+                 model = RecurrentPPO(
+                    lstm_policy_type, 
+                    env, 
+                    verbose=1,
+                    tensorboard_log=config.LOG_DIR,
+                    learning_rate=lr_schedule,
+                    n_steps=config.N_STEPS,
+                    batch_size=config.BATCH_SIZE,
+                    n_epochs=getattr(config, 'N_EPOCHS', 10),
+                    ent_coef=getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01)),
+                    gamma=0.99,
+                    gae_lambda=0.95,
+                    clip_range=config.CLIP_RANGE,
+                    device="cuda",
+                    policy_kwargs=policy_kwargs 
+                 )
+            else:
+                 # Standard PPO
+                 print(f"Creating NEW MODEL ({policy_kwargs['net_arch']['pi'][0]}x{policy_kwargs['net_arch']['pi'][1]})...")
+                 model = PPO(
+                    policy_type, 
+                    env, 
+                    verbose=1,
+                    tensorboard_log=config.LOG_DIR,
+                    learning_rate=lr_schedule,
+                    n_steps=config.N_STEPS,          
+                    batch_size=config.BATCH_SIZE,       
+                    n_epochs=getattr(config, 'N_EPOCHS', 10),
+                    ent_coef=getattr(config, 'ENTROPY_COEF', getattr(config, 'ENT_COEF', 0.01)),
+                    gamma=0.99,
+                    gae_lambda=0.95,
+                    clip_range=config.CLIP_RANGE,
+                    device="cuda",
+                    policy_kwargs=policy_kwargs
+                 )
         reset_timesteps = True
 
     checkpoint_callback = CheckpointCallback(
