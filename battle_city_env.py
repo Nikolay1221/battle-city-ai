@@ -331,14 +331,14 @@ class BattleCityEnv(gym.Env):
                  sector = (sec_x, sec_y)
                  
                  if sector not in self.visited_sectors:
-                     reward += 0.02 # Discovery Bonus! (Tiny epsilon)
+                     reward += 0.1 # Discovery Bonus! (Increased)
                      self.visited_sectors.add(sector)
                      # print(f"DEBUG: New Sector Discovered {sector}!")
             else:
                  self.idle_steps += 1
                  
-            # Threshold: 10 steps
-            if self.idle_steps > 10:
+            # Threshold: 30 steps (approx 2 sec) - allow camping/aiming
+            if self.idle_steps > 30:
                 reward -= 0.02 # Standard normalized penalty
 
 
