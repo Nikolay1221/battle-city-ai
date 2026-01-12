@@ -305,7 +305,9 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
         
         self.stack_size = config.STACK_SIZE
-        self.ram_size = 2048 # Fixed NES RAM
+        # self.ram_size = 2048 # Fixed NES RAM (DEPRECATED)
+        # Calculate Input Feature Size dynamically (e.g., 32 or 2048)
+        self.ram_size = observation_space.shape[0] // self.stack_size
         self.d_model = 512   # Embedding Size
         self.nhead = 8
         self.num_layers = 4
