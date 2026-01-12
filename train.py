@@ -21,6 +21,7 @@ except ImportError:
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 from stable_baselines3.common.env_util import make_vec_env # Needed for dynamic kwargs
+from stable_baselines3.common.vec_env import VecNormalize # <--- Added
 from battle_city_env import BattleCityEnv
 import torch as th # Added for Architecture Config
 
@@ -304,7 +305,9 @@ class TransformerFeatureExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim)
         
         self.stack_size = config.STACK_SIZE
-        self.ram_size = 2048 # Fixed NES RAM
+        # self.ram_size = 2048 # Fixed NES RAM (DEPRECATED)
+        # Calculate Input Feature Size dynamically (e.g., 32 or 2048)
+        self.ram_size = observation_space.shape[0] // self.stack_size
         self.d_model = 512   # Embedding Size
         self.nhead = 8
         self.num_layers = 4
@@ -362,6 +365,9 @@ def train():
         env = make_vec_env(BattleCityEnv, n_envs=config.NUM_CPU, seed=42, vec_env_cls=SubprocVecEnv, env_kwargs=env_kwargs)
     else:
         env = make_vec_env(BattleCityEnv, n_envs=1, seed=42, vec_env_cls=DummyVecEnv, env_kwargs=env_kwargs)
+
+    # Apply VecNormalize (Stabilizes Training)
+    env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
     # Load or Create Model
     # Choose Policy Type based on Config
@@ -424,6 +430,7 @@ def train():
 
     # --- MODEL CREATION ---
     if model is None:
+        if getattr(config, 'USE_TRANSFORMER', False):
             # HYBRID MODE: Tansformer + LSTM
             if getattr(config, 'USE_RECURRENT', False): 
                  print("Creating NEW MODEL (Hybrid: Transformer + RecurrentPPO)...")

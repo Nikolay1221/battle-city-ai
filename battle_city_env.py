@@ -5,6 +5,8 @@ from nes_py.wrappers import JoypadSpace
 import cv2
 import numpy as np
 from collections import deque
+import glob
+import os
 
 class BattleCityEnv(gym.Env):
     metadata = {'render_modes': ['human', 'rgb_array'], 'render_fps': 60}
@@ -45,16 +47,20 @@ class BattleCityEnv(gym.Env):
         self.action_space = spaces.Discrete(len(actions))
 
         # Dynamic Observation Space
-        ram_size = 2048 * self.STACK_SIZE
+        # SMART FEATURES (Coordinates + Line of Sight)
+        # 40 Features per frame:
+        # [Px, Py,  (Ex1, Ey1, Rx1, Ry1, LoS1), ... (E4...), Metadata...]
+        self.FEATURES_DIM = 40 
+        ram_size = self.FEATURES_DIM * self.STACK_SIZE
         
         if self.USE_VISION:
-            # DICT: Screen + RAM
+            # DICT: Screen + Features
             self.observation_space = spaces.Dict({
                 "screen": spaces.Box(low=0, high=255, shape=(84, 84, self.STACK_SIZE), dtype=np.uint8),
                 "ram": spaces.Box(low=0.0, high=1.0, shape=(ram_size,), dtype=np.float32)
             })
         else:
-            # BOX: RAM Only
+            # BOX: Features Only
             self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(ram_size,), dtype=np.float32)
         
         # RAM Stack Buffer
@@ -64,10 +70,26 @@ class BattleCityEnv(gym.Env):
         self.game_over_tmpl = None
         try:
             self.game_over_tmpl = cv2.imread('templates/game_over.png', cv2.IMREAD_GRAYSCALE)
+            self.base_destroyed_tmpl = cv2.imread('templates/base_destroyed.png', cv2.IMREAD_GRAYSCALE)
+            
+            if self.base_destroyed_tmpl is None:
+                print("Warning: templates/base_destroyed.png not found!")
+
             if self.game_over_tmpl is None:
                 print("Warning: templates/game_over.png not found. Switched to RAM Game Over (Experimental).")
-        except Exception:
-             print("Warning: Template load failed. Switched to RAM Game Over.")
+                
+            # Load Enemy Templates (All 16x16)
+            self.enemy_templates = []
+            tmpl_files = glob.glob('templates/enemies/*.png')
+            for f in tmpl_files:
+                t = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
+                if t is not None:
+                    self.enemy_templates.append(t)
+            print(f"Loaded {len(self.enemy_templates)} enemy templates (16x16).")
+            
+        except Exception as e:
+            print(f"Error loading templates: {e}")
+            self.game_over_tmpl = None
 
         # RAM Addresses
         self.ADDR_LIVES = 0x51
@@ -80,15 +102,12 @@ class BattleCityEnv(gym.Env):
         self.prev_kills = [0, 0, 0, 0]
         self.prev_bonus = 0
         self.prev_stage = 0
-        
-        # Idle Penalty Vars
-        # FOUND BY SCANNER & CONFIRMED BY USER:
-        # X: 0x90 
-        # Y: 0x98 (User reports 0x98 for Up/Down)
-        self.ADDR_X = 0x0090
-        self.ADDR_Y = 0x0098
         self.prev_x = 0
         self.prev_y = 0
+        
+        # Idle Penalty Vars
+        self.ADDR_X = 0x0090
+        self.ADDR_Y = 0x0098
         self.idle_steps = 0
         self.IDLE_THRESHOLD = 30 # 30 steps * 4 frames = 120 frames (~2 sec)
         
@@ -105,20 +124,82 @@ class BattleCityEnv(gym.Env):
         return resized # (84, 84)
 
     def _get_obs(self):
-        # ... (Image processing handled by frames stack, assumed done in step/reset) ...
-        # 2. RAM Stack
-        raw_ram = self.raw_env.ram
-        # Normalize IMMEDIATELY (0-255 -> 0.0-1.0)
-        current_ram_snap = np.array(raw_ram[:2048], dtype=np.float32) / 255.0
+        # 1. Vision Stack (Updated via step/reset)
+        
+        # 2. Smart Features Stack (Coordinates + LoS)
+        ram = self.raw_env.ram
+        screen = self.raw_env.screen # (240, 256, 3)
+        
+        # Build Feature Vector (40 floats)
+        features = np.zeros(self.FEATURES_DIM, dtype=np.float32)
+        
+        # Player
+        px_ram = ram[0x90]
+        py_ram = ram[0x98]
+        features[0] = px_ram / 255.0 # X
+        features[1] = py_ram / 255.0 # Y
+        
+        # Enemies (Slots 1-4)
+        # Each enemy gets 5 features: [Ex, Ey, RelX, RelY, LoS]
+        base_idx = 2
+        
+        for i in range(1, 5):
+            # CAST TO INT to prevent uint8 overflow (Crashing bug fix)
+            ex_ram = int(ram[0x90+i])
+            ey_ram = int(ram[0x98+i])
+            px_int = int(px_ram)
+            py_int = int(py_ram)
+            
+            # 1. Absolute Coords
+            features[base_idx]     = ex_ram / 255.0
+            features[base_idx + 1] = ey_ram / 255.0
+            
+            # 2. Relative Coords
+            features[base_idx + 2] = (ex_ram - px_int) / 255.0
+            features[base_idx + 3] = (ey_ram - py_int) / 255.0
+            
+            # 3. Line of Sight (Raycast)
+            los = 0.0
+            
+            # GAME MECHANIC CHECK: Axis Alignment
+            # Tanks cannot shoot diagonally. Only check LoS if aligned.
+            dx = abs(ex_ram - px_int)
+            dy = abs(ey_ram - py_int)
+            is_aligned = (dx < 12) or (dy < 12) # ~12px width leniency
+            
+            if (ex_ram != 0 or ey_ram != 0) and is_aligned:
+                los = 1.0
+                # DENSER SAMPLING (10 points) to catch thin walls
+                for t in np.linspace(0.1, 0.9, 10):
+                    sx = int(px_int + (ex_ram - px_int) * t)
+                    sy = int(py_int + (ey_ram - py_int) * t)
+                    
+                    # Bounds check
+                    if 0 <= sx < 256 and 0 <= sy < 240:
+                        pixel = screen[sy, sx] # RGB
+                        # Brick (Red/Orange), Concrete (White/Grey) -> High Red.
+                        # Trees (Green), Water (Blue) -> Low Red.
+                        if pixel[0] > 60:  # Lowered threshold slightly to catch dark bricks
+                             los = 0.0 # Blocked
+                             break
+            
+            features[base_idx + 4] = los
+            base_idx += 5
+            
+        # Metadata (starts at index 2 + 4*5 = 22)
+        features[22] = ram[self.ADDR_LIVES] / 10.0 # Lives
+        current_kills = sum([ram[k] for k in self.ADDR_KILLS])
+        features[23] = current_kills / 20.0 # Kills
+        features[24] = ram[self.ADDR_STAGE] / 35.0 # Stage
         
         # Add to stack
-        self.ram_stack.append(current_ram_snap)
+        self.ram_stack.append(features)
         
         # Fill if empty (first frame)
         while len(self.ram_stack) < self.STACK_SIZE:
-             self.ram_stack.append(current_ram_snap)
+             self.ram_stack.append(features)
              
-        # Flatten Stack: [Frame1, Frame2, Frame3, Frame4] -> Vector
+        # Flatten Stack: [Feat1, Feat2, Feat3, Feat4] -> Vector
         ram_obs = np.concatenate(self.ram_stack) 
         
         if not self.USE_VISION:
@@ -155,13 +236,9 @@ class BattleCityEnv(gym.Env):
         
         # Auto-Skip Menu using RAW ENV actions (byte)
         # Start button is 0x08 (bit 3) -> 8
-        # print("DEBUG: Resetting... Looping to Start Game (Optimized)")
-        
-        # Removed 60-frame warm-up to reduce "pause"
         
         # 2. Hardcoded Start Sequence (3 Presses for Level Select)
         # Sequence: Title -> [Start] -> Mode -> [Start] -> Level Select? -> [Start] -> Game
-        # print("DEBUG: Resetting... Executing Hardcoded Start Sequence (3 Presses)")
         
         # 1. Wait for Title (Robust Buffer)
         for _ in range(80): self.raw_env.step(0)
@@ -183,7 +260,6 @@ class BattleCityEnv(gym.Env):
         # Check debug
         state = int(self.raw_env.ram[self.ADDR_STATE])
         lives = int(self.raw_env.ram[self.ADDR_LIVES])
-        # print(f"DEBUG: Sequence Complete. State: {state:02X}, Lives: {lives}")
             
         self.prev_lives = int(self.raw_env.ram[self.ADDR_LIVES])
         self.prev_kills = [int(self.raw_env.ram[addr]) for addr in self.ADDR_KILLS]
@@ -199,10 +275,9 @@ class BattleCityEnv(gym.Env):
         for _ in range(self.STACK_SIZE):
             self.frames.append(processed)
             
-        # Fill RAM Stack (Initialize with current state)
-        initial_ram = np.array(self.raw_env.ram[:2048], dtype=np.float32) / 255.0
-        for _ in range(self.STACK_SIZE):
-            self.ram_stack.append(initial_ram)
+        # Fill RAM Stack with FRESH Smart Features (not old raw RAM)
+        # Just call _get_obs() once - it auto-fills the stack with current state
+        # (The while-loop inside _get_obs handles empty stack)
             
         return self._get_obs(), {} # Return (Obs, Info) for Gymnasium
         
@@ -229,19 +304,11 @@ class BattleCityEnv(gym.Env):
              self.frames.append(processed)
              info['render'] = processed 
         else:
-             # Skip expensive CV2 if blind
-             # But keep stack full for consistency if we switch back
-             # We just push zeros or skip entirely?
-             # Logic expects self.frames to exist for RenderCallback in VISUAL mode.
-             # If HEADLESS, we don't care.
-             # Just append dummy if needed or nothing?
-             # RenderCallback checks info['render'].
              info['render'] = None 
         
         ram = self.raw_env.ram # Access RAM from raw env
         reward = 0 
         
-        # 0. Time Penalty
         # 0. Time Penalty
         if self.steps_in_episode >= self.MAX_STEPS:
             truncated = True # Time Limit = Truncated
@@ -252,22 +319,13 @@ class BattleCityEnv(gym.Env):
         for i in range(4):
             diff = curr_kills[i] - self.prev_kills[i]
             if diff > 0 and diff < 10:
-                # OLD: pts = (i + 1) * 100 (100..400)
-                # NORMALIZED TO GOLDEN ZONE (Points / 1000)
-                # Tank 1 (100pts) -> 1.0 (Base)
-                # Tank 2 (200pts) -> 1.5 (Fast)
-                # Tank 3 (300pts) -> 2.0 (Power)
-                # Tank 4 (400pts) -> 3.0 (Bonus)
                 base_scores = [1.0, 1.5, 2.0, 3.0] 
                 pts = base_scores[i]
                 reward += pts * diff 
         self.prev_kills = curr_kills
         
         # 2. Bonus
-        # RAM[0x62] behaves as a timer (0 -> 49 ... -> 0).
-        # We reward on INCREASE (0->49 or restart).
         curr_bonus = int(ram[self.ADDR_BONUS])
-        
         if curr_bonus > self.prev_bonus:
              reward += 0.5 # Normalized (+5.0 -> +0.5)
              
@@ -280,52 +338,62 @@ class BattleCityEnv(gym.Env):
         # 3. Death
         curr_lives = int(ram[self.ADDR_LIVES])
         if curr_lives < 10 and self.prev_lives < 10:
-             # Check if we didn't just reset (sometimes state creates ghost lives)
              if curr_lives < self.prev_lives:
                 reward -= 1.0 # Normalized (-0.5 -> -0.1 -> -1.0) Symmetric to Kill
         self.prev_lives = curr_lives
         
-        # 4. Game Over (Hybrid: Vision Prefered, RAM Fallback)
-        curr_state = int(ram[self.ADDR_STATE]) # Get current state for RAM fallback
-        if self.game_over_tmpl is not None:
-             # Vision Check
+        # 4. Game Over Logic (Specific)
+        # A. Base Destroyed (Vision)
+        if self.base_destroyed_tmpl is not None:
              gray_full = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
-             res = cv2.matchTemplate(gray_full, self.game_over_tmpl, cv2.TM_CCOEFF_NORMED)
-             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+             res = cv2.matchTemplate(gray_full, self.base_destroyed_tmpl, cv2.TM_CCOEFF_NORMED)
+             _, max_val, _, _ = cv2.minMaxLoc(res)
              
-             if max_val > 0.7: 
-                  terminated = True 
-                  if curr_lives >= self.prev_lives:
-                      reward -= 3.0 # Base Destroyed
-                  else:
-                      reward -= 1.0
-        else:
-             # RAM Fallback (If template missing)
-             # State 0xE0 appears to be Game Over in some versions
-             if curr_state == 0xE0: 
+             if max_val > 0.8: 
                   terminated = True
-                  if curr_lives >= self.prev_lives:
-                       reward -= 3.0
-                  else:
-                       reward -= 1.0 
+                  reward -= 10.0 # HUGE PENALTY for losing base
+                  info['game_over_reason'] = 'base_destroyed'
+                  
+        # B. Out of Lives (RAM)
+        if curr_lives == 0:
+             terminated = True
+             reward -= 5.0 # Extra penalty for losing all lives
+             info['game_over_reason'] = 'out_of_lives'
             
         # 5. Idle Penalty (Coordinate Based)
-        
         curr_x = int(ram[self.ADDR_X])
         curr_y = int(ram[self.ADDR_Y])
         
+        # --- DISTANCE CALCULATION ---
+        player_cv, enemies_data = self._detect_enemies(obs)
+        if player_cv: info['player_cv'] = player_cv
+        
+        info['enemies_detected'] = len(enemies_data)
+        if enemies_data:
+            # enemies_data: list of (x, y, tmpl_id, score, is_visible)
+            dists = [np.sqrt((curr_x - ex)**2 + (curr_y - ey)**2) for (ex, ey, *_) in enemies_data]
+            closest_dist = min(dists)
+            info['closest_enemy_dist'] = closest_dist
+            
+            # 8. HUNT REWARD (Distance Shaping)
+            # If closer than before, +Reward
+            if closest_dist < self.prev_dist:
+                reward += 0.005 # Getting closer
+            
+            self.prev_dist = closest_dist
+        else:
+            info['closest_enemy_dist'] = 999.0
+            self.prev_dist = 999.0
+            
+        # 7. Add Enemy Positions to Info (For render script)
+        info['enemy_positions'] = enemies_data
+            
         # 6. MOVEMENT REWARD (Normalized)
-        # Small incentive to move, but NOT enough to outweigh killing.
-        # Kill (+5.0) >> Move (+0.05). 
         if curr_lives > 0:
-            # 6. MOVEMENT REWARD (Normalized)
             if curr_x != self.prev_x or curr_y != self.prev_y:
-                 # reward += 0.0 # Movement reward REMOVED (Noise)
                  self.idle_steps = 0
                  
                  # 7. GRID EXPLORATION (New!)
-                 # Map is approx 240x240. Sectors of 16x16 (Standard Tile Size)
-                 # X: 0..255, Y: 0..240
                  sec_x = curr_x // 16
                  sec_y = curr_y // 16
                  sector = (sec_x, sec_y)
@@ -333,14 +401,12 @@ class BattleCityEnv(gym.Env):
                  if sector not in self.visited_sectors:
                      reward += 0.1 # Discovery Bonus! (Increased)
                      self.visited_sectors.add(sector)
-                     # print(f"DEBUG: New Sector Discovered {sector}!")
             else:
                  self.idle_steps += 1
                  
-            # Threshold: 30 steps (approx 2 sec) - allow camping/aiming
-            if self.idle_steps > 30:
-                reward -= 0.02 # Standard normalized penalty
-
+            # Threshold: 10 steps
+            if self.idle_steps > 10:
+               reward -= 0.002 # Tiny penalty (restored)
 
         else:
             self.idle_steps = 0 # Reset if dead
@@ -358,9 +424,7 @@ class BattleCityEnv(gym.Env):
         
         self.episode_score += reward
         info['score'] = self.episode_score
-
-
-
+        
         return self._get_obs(), reward, terminated, truncated, info
 
     def render(self, mode='human'):
@@ -372,3 +436,58 @@ class BattleCityEnv(gym.Env):
 
     def close(self):
         self.env.close()
+
+    # --- ENEMY DETECTION HELPER ---
+    def _detect_enemies(self, obs):
+        """
+        Detects enemies using RAM (100% Accurate).
+        RAM Map:
+        X Coords: 0x90 (Player), 0x91-0x94 (Enemies)
+        Y Coords: 0x98 (Player), 0x99-0x9C (Enemies)
+        """
+        ram = self.raw_env.ram
+        
+        # 1. Player (Slot 0)
+        px = int(ram[0x90])
+        py = int(ram[0x98])
+        # Return Center (RAM + 8) to match Enemy format
+        player_pos = (px + 8, py + 8)
+        
+        # 2. Enemies (Slots 1-4)
+        enemies = []
+        screen = self.raw_env.screen # Access screen for Raycast
+        
+        for i in range(1, 6): # Check up to 5 slots
+            # CAST TO INT (Critical Fix)
+            ex = int(ram[0x90 + i])
+            ey = int(ram[0x98 + i])
+            px_int = int(px)
+            py_int = int(py)
+            
+            if ex == 0 and ey == 0:
+                continue
+            
+            # --- LoS Check (Duplicate of _get_obs logic for Visual Debug) ---
+            is_visible = False # Default False
+            
+            # GAME MECHANIC: Axis Alignment
+            dx = abs(ex - px_int)
+            dy = abs(ey - py_int)
+            is_aligned = (dx < 12) or (dy < 12)
+            
+            if is_aligned:
+                is_visible = True
+                # DENSER SAMPLING
+                for t in np.linspace(0.1, 0.9, 10):
+                    sx = int(px_int + (ex - px_int) * t)
+                    sy = int(py_int + (ey - py_int) * t)
+                    if 0 <= sx < 256 and 0 <= sy < 240:
+                        pixel = screen[sy, sx] 
+                        if pixel[0] > 60: # Wall
+                            is_visible = False
+                            break
+            
+            # Format: (x_center, y_center, slot_id, confidence, is_visible)
+            enemies.append((ex + 8, ey + 8, i, 1.0, is_visible))
+            
+        return player_pos, enemies

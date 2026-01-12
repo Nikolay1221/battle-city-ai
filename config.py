@@ -9,7 +9,7 @@
 import multiprocessing
 import os
 # NUM_CPU = multiprocessing.cpu_count()
-NUM_CPU = 8 # Reduced for Hybrid Mode (Transformer + LSTM)
+NUM_CPU = 12 # Optimized for Colab A100 Instance
 HEADLESS_MODE = True 
 
 # --- TRAINING DURATION ---
