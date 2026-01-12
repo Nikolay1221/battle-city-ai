@@ -10,7 +10,7 @@ import multiprocessing
 import os
 # NUM_CPU = multiprocessing.cpu_count()
 NUM_CPU = 12 # Optimized for Colab A100 Instance
-HEADLESS_MODE = True 
+HEADLESS_MODE = False 
 
 # --- TRAINING DURATION ---
 TOTAL_TIMESTEPS = 100_000_000 # Forever.
@@ -20,8 +20,8 @@ FRAME_SKIP    = 4
 USE_VISION    = False 
 ROM_PATH      = "BattleCity.nes"
 
-USE_RECURRENT   = False    # <--- Disable LSTM
-USE_TRANSFORMER = True     # <--- Enable Transformer (Memory Attention)
+USE_RECURRENT   = True     # <--- Enable LSTM
+USE_TRANSFORMER = False    # <--- Disable Transformer
 
 # --- SAVING ---
 CHECKPOINT_FREQ = 50_000 

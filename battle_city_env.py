@@ -299,12 +299,12 @@ class BattleCityEnv(gym.Env):
         self.steps_in_episode += 1 
         
         # Process and Push new frame (Optimized)
+        # Process and Push new frame (Optimized)
+        processed = self._process_frame(obs)
         if self.USE_VISION:
-             processed = self._process_frame(obs)
              self.frames.append(processed)
-             info['render'] = processed 
-        else:
-             info['render'] = None 
+        
+        info['render'] = processed 
         
         ram = self.raw_env.ram # Access RAM from raw env
         reward = 0 
